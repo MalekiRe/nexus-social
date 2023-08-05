@@ -1,17 +1,14 @@
 use std::collections::HashMap;
 use std::env;
-use std::error::Error;
-use std::fs::{create_dir, OpenOptions, remove_dir};
+use std::fs::{remove_dir};
 use std::net::SocketAddr;
-use std::num::NonZeroU16;
-use std::sync::{Arc, Mutex, MutexGuard};
 use axum::Extension;
 use axum::extract::Path;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use sled::{Config, Db, IVec};
+use sled::{Db, IVec};
 use nexus_common::{FriendRequest, FriendRequestUuid, Invite, InviteUuid, Username};
 use anyhow::{Context};
 
@@ -41,11 +38,6 @@ impl<E> From<E> for AppError
     }
 }
 
-/*#[derive(Clone, Debug, Serialize, Deserialize, Default)]
-pub struct Database {
-    pub users: HashMap<String, UserData>
-}*/
-
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct UserData {
     pub friends: Vec<Username>,
@@ -71,7 +63,7 @@ pub struct State {
 impl State {
     pub fn new(port: u16) -> Self {
         let sled_path = String::from("sled") + &port.to_string();
-        remove_dir(&sled_path);
+        let _ = remove_dir(&sled_path);
         Self {
             db: sled::open(sled_path).unwrap(),
             reqwest_client: Default::default(),
@@ -105,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(p) = env::args().into_iter().collect::<Vec<_>>().get(1) {
         port = p.parse().unwrap();
     }
-    let mut state = State::new(port);
+    let state = State::new(port);
     let app = axum::Router::new()
         .route("/", get(root))
         .route("/add-user/:username", get(add_user))
@@ -139,15 +131,13 @@ async fn add_user(Extension(state): Extension<State>, Path(username): Path<Strin
     Ok(())
 }
 mod client_server {
-    use std::error::Error;
     use axum::{Extension, Json};
     use axum::extract::Path;
-    use axum::http::StatusCode;
     use axum::response::IntoResponse;
     use serde_json::Value;
     use anyhow::{Context};
     use crate::Result;
-    use nexus_common::{FriendRequest, FriendRequestUuid, UnfriendRequest, Username};
+    use nexus_common::{FriendRequest, FriendRequestUuid, UnfriendRequest};
     use crate::State;
 
     pub async fn get_friends(Extension(state): Extension<State>, Path(username): Path<String>) -> Result<impl IntoResponse> {
@@ -188,7 +178,7 @@ mod client_server {
     }
     pub async fn post_accept_friend_request(Extension(state): Extension<State>, Path(username): Path<String>, Json(payload): Json<Value>) -> Result<impl IntoResponse> {
         println!("client_client::post_accept_friend_request");
-        let mut friend_request_uuid: FriendRequestUuid = serde_json::from_value(payload)?;
+        let friend_request_uuid: FriendRequestUuid = serde_json::from_value(payload)?;
         let user_from = state.user(&username)?.friend_requests.remove(&friend_request_uuid)
             .context("FriendRequestUuid not found")?.from;
         state.user_mut(&username, |user| { user.friend_requests.remove(&friend_request_uuid).unwrap(); })?;
@@ -205,7 +195,7 @@ mod client_server {
     }
     pub async fn post_deny_friend_request(Extension(state): Extension<State>, Path(username): Path<String>, Json(payload): Json<Value>) -> Result<impl IntoResponse> {
         println!("client_client::post_deny_friend_request");
-        let mut friend_request_uuid: FriendRequestUuid = serde_json::from_value(payload)?;
+        let friend_request_uuid: FriendRequestUuid = serde_json::from_value(payload)?;
         let user_from = state.user(&username)?.friend_requests.remove(&friend_request_uuid)
             .context("FriendRequestUuid not found")?.from;
         state.user_mut(&username, |user| { user.friend_requests.remove(&friend_request_uuid).unwrap(); })?;
@@ -236,9 +226,8 @@ mod server_server {
     use axum::{Extension, Json};
     use axum::extract::Path;
     use axum::response::IntoResponse;
-    use reqwest::StatusCode;
     use serde_json::Value;
-    use nexus_common::{FriendRequest, FriendRequestUuid, UnfriendRequest, Username};
+    use nexus_common::{FriendRequest, FriendRequestUuid, UnfriendRequest};
     use anyhow::{Context};
     use crate::State;
     use crate::Result;
