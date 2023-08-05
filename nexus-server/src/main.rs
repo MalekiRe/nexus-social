@@ -1,20 +1,50 @@
 use std::collections::HashMap;
 use std::env;
+use std::error::Error;
+use std::fs::{create_dir, OpenOptions, remove_dir};
 use std::net::SocketAddr;
+use std::num::NonZeroU16;
 use std::sync::{Arc, Mutex, MutexGuard};
 use axum::Extension;
 use axum::extract::Path;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+use sled::{Config, Db, IVec};
 use nexus_common::{FriendRequest, FriendRequestUuid, Invite, InviteUuid, Username};
+use anyhow::{Context};
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
-pub struct Database {
-    pub users: HashMap<String, UserData>
+pub type Result<T> = std::result::Result<T, AppError>;
+
+pub struct AppError(anyhow::Error);
+
+// Tell axum how to convert `AppError` into a response.
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Something went wrong: {}", self.0),
+        )
+            .into_response()
+    }
 }
 
+// This enables using `?` on functions that return `Result<_, anyhow::Error>` to turn them into
+// `Result<_, AppError>`. That way you don't need to do that manually.
+impl<E> From<E> for AppError
+    where
+        E: Into<anyhow::Error>,
+{
+    fn from(err: E) -> Self {
+        Self(err.into())
+    }
+}
+
+/*#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct Database {
+    pub users: HashMap<String, UserData>
+}*/
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct UserData {
@@ -27,27 +57,42 @@ pub struct UserData {
     pub rec_invites: Vec<InviteUuid>,
 }
 
-#[derive(Default)]
-pub struct InnerState {
-    db: Database,
+impl From<UserData> for IVec {
+    fn from(value: UserData) -> Self {
+        serde_json::to_vec(&value).unwrap().into()
+    }
+}
+
+#[derive(Clone)]
+pub struct State {
+    db: Db,
     reqwest_client: reqwest::Client,
 }
-#[derive(Clone)]
-pub struct State(pub Arc<Mutex<InnerState>>);
 impl State {
-    pub fn new() -> Self {
-        Self(Arc::new(Mutex::new(InnerState::default())))
+    pub fn new(port: u16) -> Self {
+        let sled_path = String::from("sled") + &port.to_string();
+        remove_dir(&sled_path);
+        Self {
+            db: sled::open(sled_path).unwrap(),
+            reqwest_client: Default::default(),
+        }
     }
-    pub fn get(&self) -> MutexGuard<InnerState> {
-        self.0.lock().unwrap()
+    pub fn user(&self, user: impl AsRef<str>) -> Result<UserData> {
+        Ok(serde_json::from_slice(&self.db.get(user.as_ref())?.with_context(|| "Error getting user")?)?)
     }
-}
-impl InnerState {
-    pub fn user(&self, user: impl AsRef<str>) -> Result<&UserData, StatusCode> {
-        self.db.users.get(user.as_ref()).ok_or(StatusCode::NOT_FOUND)
+    pub fn try_user_mut(&self, user: impl AsRef<str>, func: impl Fn(&mut UserData) -> Result<()> ) -> Result<()> {
+        let user = user.as_ref();
+        let mut user_data = serde_json::from_slice(&self.db.get(user)?.with_context(|| "Error getting user")?)?;
+        func(&mut user_data)?;
+        self.db.insert(user, serde_json::to_vec(&user_data)?)?;
+        Ok(())
     }
-    pub fn user_mut(&mut self, user: impl AsRef<str>) -> Result<&mut UserData, StatusCode> {
-        self.db.users.get_mut(user.as_ref()).ok_or(StatusCode::NOT_FOUND)
+    pub fn user_mut(&self, user: impl AsRef<str>, mut func: impl FnMut(&mut UserData)) -> Result<()> {
+        let user = user.as_ref();
+        let mut user_data = serde_json::from_slice(&self.db.get(user)?.with_context(|| "Error getting user")?)?;
+        func(&mut user_data);
+        self.db.insert(user, serde_json::to_vec(&user_data)?)?;
+        Ok(())
     }
     pub fn reqwest_client(&self) -> reqwest::Client {
         self.reqwest_client.clone()
@@ -56,7 +101,11 @@ impl InnerState {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let mut state = State::new();
+    let mut port = 8000;
+    if let Some(p) = env::args().into_iter().collect::<Vec<_>>().get(1) {
+        port = p.parse().unwrap();
+    }
+    let mut state = State::new(port);
     let app = axum::Router::new()
         .route("/", get(root))
         .route("/add-user/:username", get(add_user))
@@ -74,10 +123,6 @@ async fn main() -> anyhow::Result<()> {
         .route("/:username/friend/post/unfriend", post(server_server::post_unfriend))
         .layer(Extension(state))
         ;
-    let mut port = 8000;
-    if let Some(p) = env::args().into_iter().collect::<Vec<_>>().get(1) {
-        port = p.parse().unwrap();
-    }
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     println!("listening on {}", addr);
     axum::Server::bind(&addr)
@@ -89,107 +134,100 @@ async fn main() -> anyhow::Result<()> {
 async fn root(Extension(_state): Extension<State>) -> &'static str {
     "Hello World!"
 }
-async fn add_user(Extension(state): Extension<State>, Path(username): Path<String>) -> Result<impl IntoResponse, StatusCode> {
-    state.get().db.users.insert(username, UserData::default());
+async fn add_user(Extension(state): Extension<State>, Path(username): Path<String>) -> Result<impl IntoResponse> {
+    state.db.insert(username, serde_json::to_vec(&UserData::default())?)?;
     Ok(())
 }
 mod client_server {
+    use std::error::Error;
     use axum::{Extension, Json};
     use axum::extract::Path;
+    use axum::http::StatusCode;
     use axum::response::IntoResponse;
-    use reqwest::StatusCode;
     use serde_json::Value;
+    use anyhow::{Context};
+    use crate::Result;
     use nexus_common::{FriendRequest, FriendRequestUuid, UnfriendRequest, Username};
     use crate::State;
 
-    pub async fn get_friends(Extension(state): Extension<State>, Path(username): Path<String>) -> Result<impl IntoResponse, StatusCode> {
-        serde_json::to_string(&state.get()
+    pub async fn get_friends(Extension(state): Extension<State>, Path(username): Path<String>) -> Result<impl IntoResponse> {
+        Ok(serde_json::to_string(&state
             .user(username)?
             .friends
-        ).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        )?)
     }
-    pub async fn get_sent_friend_requests(Extension(state): Extension<State>, Path(username): Path<String>) -> Result<impl IntoResponse, StatusCode> {
-        serde_json::to_string(&state
-            .get()
+    pub async fn get_sent_friend_requests(Extension(state): Extension<State>, Path(username): Path<String>) -> Result<impl IntoResponse> {
+        Ok(serde_json::to_string(&state
             .user(username)?
             .sent_friend_requests
-        ).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        )?)
     }
-    pub async fn get_rec_friend_requests(Extension(state): Extension<State>, Path(username): Path<String>) -> Result<impl IntoResponse, StatusCode> {
-        serde_json::to_string(&state
-            .get()
+    pub async fn get_rec_friend_requests(Extension(state): Extension<State>, Path(username): Path<String>) -> Result<impl IntoResponse> {
+        Ok(serde_json::to_string(&state
             .user(username)?
             .rec_friend_requests
-        ).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        )?)
     }
-    pub async fn get_friend_request(Extension(state): Extension<State>, Path((username, uuid)): Path<(String, String)>) -> Result<impl IntoResponse, StatusCode> {
-        serde_json::to_string(&state
-            .get()
+    pub async fn get_friend_request(Extension(state): Extension<State>, Path((username, uuid)): Path<(String, String)>) -> Result<impl IntoResponse> {
+        Ok(serde_json::to_string(&state
             .user(username)?
             .friend_requests
-                .get(&FriendRequestUuid(uuid))
-                .ok_or(StatusCode::NOT_FOUND)?
-        ).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+                .get(&FriendRequestUuid(uuid)).with_context(|| "FriendRequestUuid not found")?
+        )?)
     }
-    pub async fn post_send_friend_request(Extension(state): Extension<State>, Path(username): Path<String>, Json(payload): Json<Value>) -> Result<impl IntoResponse, StatusCode> {
-        let friend_request: FriendRequest = serde_json::from_value(payload).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        state.get().user_mut(&username)?.friend_requests.insert(friend_request.uuid.clone(), friend_request.clone());
-        state.get().user_mut(&username)?.sent_friend_requests.push(friend_request.uuid.clone());
-        eprintln!("A");
-        let client = state.get().reqwest_client();
-            client
+    pub async fn post_send_friend_request(Extension(state): Extension<State>, Path(username): Path<String>, Json(payload): Json<Value>) -> Result<impl IntoResponse> {
+        let friend_request: FriendRequest = serde_json::from_value(payload)?;
+        state.try_user_mut(&username, |user| Ok({ user.friend_requests.insert(friend_request.uuid.clone(), friend_request.clone()); }))?;
+        state.try_user_mut(&username, |user| Ok({ user.sent_friend_requests.push(friend_request.uuid.clone()); }))?;
+        state.reqwest_client
             .post(friend_request.to.to_url().0 + "/public/post/send-friend-request")
             .json(&friend_request)
             .send()
-            .await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            .await?;
         Ok(())
     }
-    pub async fn post_accept_friend_request(Extension(state): Extension<State>, Path(username): Path<String>, Json(payload): Json<Value>) -> Result<impl IntoResponse, StatusCode> {
+    pub async fn post_accept_friend_request(Extension(state): Extension<State>, Path(username): Path<String>, Json(payload): Json<Value>) -> Result<impl IntoResponse> {
         println!("client_client::post_accept_friend_request");
-        let mut friend_request_uuid: FriendRequestUuid = serde_json::from_value(payload).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let user_from = state.get().user_mut(&username)?.friend_requests.remove(&friend_request_uuid).ok_or(StatusCode::NOT_FOUND)?
-            .from;
-        let pos = state.get().user(&username)?.rec_friend_requests.iter().position(|uuid| uuid.0 == friend_request_uuid.0)
-            .ok_or(StatusCode::NOT_FOUND)?;
-        state.get().user_mut(&username)?.rec_friend_requests.remove(pos);
-        let client = state.get().reqwest_client();
-            client
+        let mut friend_request_uuid: FriendRequestUuid = serde_json::from_value(payload)?;
+        let user_from = state.user(&username)?.friend_requests.remove(&friend_request_uuid)
+            .context("FriendRequestUuid not found")?.from;
+        state.user_mut(&username, |user| { user.friend_requests.remove(&friend_request_uuid).unwrap(); })?;
+        let pos = state.user(&username)?.rec_friend_requests.iter().position(|uuid| uuid.0 == friend_request_uuid.0)
+            .with_context(|| "FriendRequestUuid not found")?;
+        state.user_mut(&username, |user| { user.rec_friend_requests.remove(pos); })?;
+        state.reqwest_client
             .post(user_from.to_url().0 + "/public/post/accept-friend-request")
             .json(&friend_request_uuid)
             .send()
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        state.get().user_mut(username)?.friends.push(user_from);
+            .await?;
+        state.user_mut(username, |user| user.friends.push(user_from.clone()) )?;
         Ok(())
     }
-    pub async fn post_deny_friend_request(Extension(state): Extension<State>, Path(username): Path<String>, Json(payload): Json<Value>) -> Result<impl IntoResponse, StatusCode> {
+    pub async fn post_deny_friend_request(Extension(state): Extension<State>, Path(username): Path<String>, Json(payload): Json<Value>) -> Result<impl IntoResponse> {
         println!("client_client::post_deny_friend_request");
-        let mut friend_request_uuid: FriendRequestUuid = serde_json::from_value(payload).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let user_from = state.get().user_mut(&username)?.friend_requests.remove(&friend_request_uuid).ok_or(StatusCode::NOT_FOUND)?
-            .from;
-        let pos = state.get().user(&username)?.rec_friend_requests.iter().position(|uuid| uuid.0 == friend_request_uuid.0)
-            .ok_or(StatusCode::NOT_FOUND)?;
-        state.get().user_mut(&username)?.rec_friend_requests.remove(pos);
-        let client = state.get().reqwest_client();
-        client
+        let mut friend_request_uuid: FriendRequestUuid = serde_json::from_value(payload)?;
+        let user_from = state.user(&username)?.friend_requests.remove(&friend_request_uuid)
+            .context("FriendRequestUuid not found")?.from;
+        state.user_mut(&username, |user| { user.friend_requests.remove(&friend_request_uuid).unwrap(); })?;
+        let pos = state.user(&username)?.rec_friend_requests.iter().position(|uuid| uuid.0 == friend_request_uuid.0)
+            .with_context(|| "FriendRequestUuid not found")?;
+        state.user_mut(&username, |user| { user.rec_friend_requests.remove(pos); })?;
+        state.reqwest_client
             .post(user_from.to_url().0 + "/public/post/deny-friend-request")
             .json(&friend_request_uuid)
             .send()
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            .await?;
         Ok(())
     }
-    pub async fn post_unfriend(Extension(state): Extension<State>, Path(username): Path<String>, Json(payload): Json<Value>) -> Result<impl IntoResponse, StatusCode> {
+    pub async fn post_unfriend(Extension(state): Extension<State>, Path(username): Path<String>, Json(payload): Json<Value>) -> Result<impl IntoResponse> {
         println!("client_client::post_unfriend");
-        let unfriend_request: UnfriendRequest = serde_json::from_value(payload).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        state.get().user_mut(&username)?.friends.retain(|f| f.clone() != unfriend_request.to);
-        let client = state.get().reqwest_client();
-        client
+        let unfriend_request: UnfriendRequest = serde_json::from_value(payload)?;
+        state.user_mut(&username, |user| { user.friends.retain(|f| f.clone() != unfriend_request.to); })?;
+        state.reqwest_client
             .post(unfriend_request.to.to_url().0 + "/friend/post/unfriend")
             .json(&unfriend_request)
             .send()
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            .await?;
         Ok(())
     }
 }
@@ -201,40 +239,40 @@ mod server_server {
     use reqwest::StatusCode;
     use serde_json::Value;
     use nexus_common::{FriendRequest, FriendRequestUuid, UnfriendRequest, Username};
+    use anyhow::{Context};
     use crate::State;
+    use crate::Result;
 
-    pub async fn post_send_friend_request(Extension(state): Extension<State>, Path(username): Path<String>, Json(payload): Json<Value>) -> Result<impl IntoResponse, StatusCode> {
+    pub async fn post_send_friend_request(Extension(state): Extension<State>, Path(username): Path<String>, Json(payload): Json<Value>) -> Result<impl IntoResponse> {
         println!("server_server::post_send_friend_request");
-        let friend_request: FriendRequest = serde_json::from_value(payload).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let mut state = state.get();
-        state.user_mut(&username)?.friend_requests.insert(friend_request.uuid.clone(), friend_request.clone());
-        state.user_mut(&username)?.rec_friend_requests.push(friend_request.uuid.clone());
+        let friend_request: FriendRequest = serde_json::from_value(payload)?;
+        state.user_mut(&username, |user| { user.friend_requests.insert(friend_request.uuid.clone(), friend_request.clone()); })?;
+        state.user_mut(&username, |user| user.rec_friend_requests.push(friend_request.uuid.clone()))?;
         Ok(())
     }
 
-    pub async fn post_accept_friend_request(Extension(state): Extension<State>, Path(username): Path<String>, Json(payload): Json<Value>) -> Result<impl IntoResponse, StatusCode> {
+    pub async fn post_accept_friend_request(Extension(state): Extension<State>, Path(username): Path<String>, Json(payload): Json<Value>) -> Result<impl IntoResponse> {
         println!("server_server::post_accept_friend_request");
-        let friend_request_uuid: FriendRequestUuid = serde_json::from_value(payload).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let mut state = state.get();
-        state.user_mut(&username)?.sent_friend_requests.retain(|f| f.0 != friend_request_uuid.0);
-        let friend_request = state.user_mut(&username)?.friend_requests.remove(&friend_request_uuid).ok_or(StatusCode::NOT_FOUND)?;
-        state.user_mut(username)?.friends.push(friend_request.to);
+        let friend_request_uuid: FriendRequestUuid = serde_json::from_value(payload)?;
+        state.user_mut(&username, |user| user.sent_friend_requests.retain(|f| f.0 != friend_request_uuid.0))?;
+        let friend_request = state.user(&username)?.friend_requests.remove(&friend_request_uuid).with_context(|| "FriendRequestUuid did not exist")?;
+        state.user_mut(&username, |user| { user.friend_requests.remove(&friend_request_uuid).unwrap(); })?;
+        state.user_mut(username, |user| user.friends.push(friend_request.to.clone()))?;
         Ok(())
     }
 
-    pub async fn post_deny_friend_request(Extension(state): Extension<State>, Path(username): Path<String>, Json(payload): Json<Value>) -> Result<impl IntoResponse, StatusCode> {
+    pub async fn post_deny_friend_request(Extension(state): Extension<State>, Path(username): Path<String>, Json(payload): Json<Value>) -> Result<impl IntoResponse> {
         println!("server_server::post_deny_friend_request");
-        let friend_request_uuid: FriendRequestUuid = serde_json::from_value(payload).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let mut state = state.get();
-        state.user_mut(&username)?.sent_friend_requests.retain(|f| f.0 != friend_request_uuid.0);
-        state.user_mut(&username)?.friend_requests.remove(&friend_request_uuid).ok_or(StatusCode::NOT_FOUND)?;
+        let friend_request_uuid: FriendRequestUuid = serde_json::from_value(payload)?;
+        state.user_mut(&username, |user| user.sent_friend_requests.retain(|f| f.0 != friend_request_uuid.0))?;
+        state.try_user_mut(&username, |user| Ok({user.friend_requests.remove(&friend_request_uuid).with_context(|| "FriendRequestUuid not found")?;}))?;
         Ok(())
     }
 
-    pub async fn post_unfriend(Extension(state): Extension<State>, Path(username): Path<String>, Json(payload): Json<Value>) -> Result<impl IntoResponse, StatusCode> {
+    pub async fn post_unfriend(Extension(state): Extension<State>, Path(username): Path<String>, Json(payload): Json<Value>) -> Result<impl IntoResponse> {
         println!("server_server::post_unfriend");
-        let unfriend_request: UnfriendRequest = serde_json::from_value(payload).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        state.get().user_mut(&username)?.friends.retain(|f| f.clone() != unfriend_request.from);
+        let unfriend_request: UnfriendRequest = serde_json::from_value(payload)?;
+        state.user_mut(&username, |user| user.friends.retain(|f| f.clone() != unfriend_request.from))?;
         Ok(())
     }
 }

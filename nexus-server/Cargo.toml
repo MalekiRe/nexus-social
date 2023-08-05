@@ -13,3 +13,4 @@ reqwest = { workspace = true, features = ["json"]}
 anyhow = { workspace = true }
 tokio = { workspace = true , features = ["full"] }
 axum  = { version = "0.6.19" , features = ["default"] }
+sled = "0.34.7"
