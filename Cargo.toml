@@ -10,7 +10,7 @@ members = ["nexus-server", "nexus-client"]
 
 [workspace.dependencies]
 serde = { version = "1.0.173", features = ["derive"]  }
-nexus-common = { path = "../nexus-common" }
+nexus-common = { path = "./" }
 nexus-server = { path = "./nexus-server"  }
 nexus-client = { path = "./nexus-client"  }
 serde_json = { version = "1.0.103" }
