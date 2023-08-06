@@ -49,39 +49,36 @@ impl<'a> Transaction<'a> {
         .map_err(AppError::from)?)
     }
 
-    pub fn try_user_mut(
+    pub fn try_user_mut<T>(
         &self,
         user: impl AsRef<str>,
-        func: impl Fn(&mut UserData) -> Result<()>,
-    ) -> ConflictableTransactionResult<(), AppError> {
+        func: impl Fn(&mut UserData) -> Result<T>,
+    ) -> ConflictableTransactionResult<T, AppError> {
         let key = user.as_ref();
         let data = self.tree.get(key)?;
-        let new_data = Self::user_mut_inner(data, &func)
+        let (new_data, result) = Self::user_mut_inner(data, &func)
             .map_err(|err| ConflictableTransactionError::Abort(err))?;
         self.tree.insert(key, new_data)?;
-        Ok(())
+        Ok(result)
     }
 
-    pub fn user_mut(
+    pub fn user_mut<T>(
         &self,
         user: impl AsRef<str>,
-        func: impl Fn(&mut UserData),
-    ) -> ConflictableTransactionResult<(), AppError> {
-        self.try_user_mut(user, |user| {
-            func(user);
-            Ok(())
-        })
+        func: impl Fn(&mut UserData) -> T,
+    ) -> ConflictableTransactionResult<T, AppError> {
+        self.try_user_mut(user, |user| Ok(func(user)))
     }
 
-    fn user_mut_inner(
+    fn user_mut_inner<T>(
         data: Option<IVec>,
-        func: &impl Fn(&mut UserData) -> Result<()>,
-    ) -> Result<Vec<u8>> {
+        func: &impl Fn(&mut UserData) -> Result<T>,
+    ) -> Result<(Vec<u8>, T)> {
         let data = data.context("User not found")?;
         let mut user = serde_json::from_slice(&data).context("Error getting user")?;
-        func(&mut user)?;
+        let result = func(&mut user)?;
         let new_data = serde_json::to_vec(&user)?;
-        Ok(new_data)
+        Ok((new_data, result))
     }
 }
 
@@ -230,25 +227,34 @@ pub async fn post_send_friend_request(
 ) -> Result<impl IntoResponse> {
     let friend_request: FriendRequest = serde_json::from_value(payload)?;
 
-    users
-        .reqwest_client
-        .post(friend_request.to.to_url().0 + "/public/post/send-friend-request")
-        .json(&friend_request)
-        .send()
-        .await?;
-
-    users.transaction(|users| {
-        users.user_mut(&username, |user| {
-            user.friend_requests
+    let existing = users.transaction(|users| {
+        let existing = users.user_mut(&username, |user| {
+            let old = user
+                .friend_requests
                 .insert(friend_request.uuid.clone(), friend_request.clone());
+
+            old.is_some()
         })?;
 
-        users.user_mut(&username, |user| {
-            user.sent_friend_requests.push(friend_request.uuid.clone());
-        })?;
+        if !existing {
+            users.user_mut(&username, |user| {
+                user.sent_friend_requests.push(friend_request.uuid.clone());
+            })?;
+        }
 
-        Ok(())
-    })
+        Ok(existing)
+    })?;
+
+    if !existing {
+        users
+            .reqwest_client
+            .post(friend_request.to.to_url().0 + "/public/post/send-friend-request")
+            .json(&friend_request)
+            .send()
+            .await?;
+    }
+
+    Ok(())
 }
 
 pub async fn post_accept_friend_request(
