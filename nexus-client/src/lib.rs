@@ -1,104 +1,170 @@
+use anyhow::{Context, Result};
+use nexus_common::{FriendRequest, FriendRequestUuid, UnfriendRequest, Username};
+use reqwest::Response;
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 use std::ffi::{c_char, CStr, CString};
-use std::process::{Child, Command};
-use std::thread;
-use std::time::Duration;
-use anyhow::Context;
-use reqwest::Client;
-use nexus_common::{FriendRequest, FriendRequestUuid, Username};
-use crate::client::{accept_friend_request, deny_friend_request, get_friend_request, get_friends, rec_friend_requests, send_friend_request, sent_friend_requests, unfriend};
+use std::process::Child;
 
-pub mod client {
-    use reqwest::Client;
-    use nexus_common::{FriendRequest, FriendRequestUuid, UnfriendRequest, Username};
-    use anyhow::Result;
-    use futures::StreamExt;
-    use crate::username_t;
-
-    pub async fn get_friends(client: &Client, username: impl AsRef<Username>) -> Result<Vec<Username>> {
-        Ok(client.get(username.as_ref().to_url().0 + "/private/get/friends")
-            .send()
-            .await?
-            .json::<_>()
-            .await?)
-    }
-    pub async fn send_friend_request(client: &Client, friend_request: FriendRequest) -> Result<()> {
-        client.post(friend_request.from.to_url().0 + "/private/post/send-friend-request")
-            .json(&friend_request)
-            .send()
-            .await?;
-        Ok(())
-    }
-    pub async fn rec_friend_requests(client: &Client, username: impl AsRef<Username>) -> Result<Vec<FriendRequestUuid>> {
-        Ok(client.get(username.as_ref().to_url().0 + "/private/get/rec-friend-requests")
-            .send()
-            .await?
-            .json::<_>()
-            .await?)
-    }
-    pub async fn sent_friend_requests(client: &Client, username: impl AsRef<Username>) -> Result<Vec<FriendRequestUuid>> {
-        Ok(client.get(username.as_ref().to_url().0 + "/private/get/sent-friend-requests")
-            .send()
-            .await?
-            .json::<_>()
-            .await?)
-    }
-    pub async fn get_friend_request(client: &Client, username: impl AsRef<Username>, fuuid: FriendRequestUuid) -> Result<FriendRequest> {
-        Ok(client.get(username.as_ref().to_url().0 + "/private/get/friend-request/" + &fuuid.0)
-            .send()
-            .await?
-            .json::<_>()
-            .await?)
-    }
-    pub async fn accept_friend_request(client: &Client, username: impl AsRef<Username>, fuuid: FriendRequestUuid) -> Result<()> {
-        client
-            .post(username.as_ref().to_url().0 + "/private/post/accept-friend-request")
-            .json(&fuuid)
-            .send()
-            .await?;
-        Ok(())
-    }
-    pub async fn deny_friend_request(client: &Client, username: impl AsRef<Username>, fuuid: FriendRequestUuid) -> Result<()> {
-        client
-            .post(username.as_ref().to_url().0 + "/private/post/deny-friend-request")
-            .json(&fuuid)
-            .send()
-            .await?;
-        Ok(())
-    }
-    pub async fn unfriend(client: &Client, username: impl AsRef<Username>, friend: impl AsRef<Username>) -> Result<()> {
-        let username = username.as_ref();
-        client
-            .post(username.to_url().0 + "/private/post/unfriend")
-            .json(&UnfriendRequest{ from: username.clone(), to: friend.as_ref().clone() })
-            .send()
-            .await?;
-        Ok(())
-    }
+pub struct Client {
+    inner: reqwest::Client,
 }
 
-async fn add_user(client: &Client, username: impl AsRef<Username>) -> anyhow::Result<()> {
-    let username = username.as_ref();
-    client.get(String::from("http://") + &username.website + "/add-user/" + &username.username)
-        .send().await?;
-    Ok(())
+impl Client {
+    pub fn new() -> Self {
+        Self {
+            inner: reqwest::Client::new(),
+        }
+    }
+
+    async fn add_user(&self, username: impl AsRef<Username>) -> anyhow::Result<()> {
+        let username = username.as_ref();
+        let route = format!("http://{}/add-user/{}", username.website, username.username);
+        self.inner.get(route).send().await.context("Adding user")?;
+        Ok(())
+    }
+
+    async fn user_get(&self, username: impl AsRef<Username>, route: &str) -> Result<Response> {
+        let route = format!("{}{}", username.as_ref().to_url().0, route);
+        let response = self
+            .inner
+            .get(&route)
+            .send()
+            .await
+            .with_context(|| format!("GET {}", route))?;
+        Ok(response)
+    }
+
+    async fn user_get_json<T>(&self, username: impl AsRef<Username>, route: &str) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        let value = self
+            .user_get(username, route)
+            .await?
+            .json()
+            .await
+            .with_context(|| format!("GET {}", route))?;
+        Ok(value)
+    }
+
+    async fn user_post<T>(
+        &self,
+        username: impl AsRef<Username>,
+        route: &str,
+        data: &T,
+    ) -> Result<()>
+    where
+        T: Serialize,
+    {
+        let route = format!("{}{}", username.as_ref().to_url().0, route);
+        self.inner
+            .post(&route)
+            .json(data)
+            .send()
+            .await
+            .with_context(|| format!("POST {}", route))?
+            .text()
+            .await
+            .with_context(|| format!("POST {}", route))?;
+        Ok(())
+    }
+
+    pub async fn get_friends(&self, username: impl AsRef<Username>) -> Result<Vec<Username>> {
+        self.user_get_json(username, "/private/get/friends").await
+    }
+
+    pub async fn rec_friend_requests(
+        &self,
+        username: impl AsRef<Username>,
+    ) -> Result<Vec<FriendRequestUuid>> {
+        self.user_get_json(username, "/private/get/rec-friend-requests")
+            .await
+    }
+
+    pub async fn sent_friend_requests(
+        &self,
+        username: impl AsRef<Username>,
+    ) -> Result<Vec<FriendRequestUuid>> {
+        self.user_get_json(username, "/private/get/sent-friend-requests")
+            .await
+    }
+
+    pub async fn get_friend_request(
+        &self,
+        username: impl AsRef<Username>,
+        fuuid: FriendRequestUuid,
+    ) -> Result<FriendRequest> {
+        let route = format!("/private/get/friend-request/{}", fuuid.0);
+        self.user_get_json(username, &route).await
+    }
+
+    pub async fn send_friend_request(&self, friend_request: &FriendRequest) -> Result<()> {
+        self.user_post(
+            &friend_request.from,
+            "/private/post/send-friend-request",
+            &friend_request,
+        )
+        .await
+    }
+
+    pub async fn accept_friend_request(
+        &self,
+        username: impl AsRef<Username>,
+        fuuid: FriendRequestUuid,
+    ) -> Result<()> {
+        self.user_post(username, "/private/post/accept-friend-request", &fuuid)
+            .await
+    }
+
+    pub async fn deny_friend_request(
+        &self,
+        username: impl AsRef<Username>,
+        fuuid: FriendRequestUuid,
+    ) -> Result<()> {
+        self.user_post(username, "/private/post/deny-friend-request", &fuuid)
+            .await
+    }
+
+    pub async fn unfriend(
+        &self,
+        username: impl AsRef<Username>,
+        friend: impl AsRef<Username>,
+    ) -> Result<()> {
+        self.user_post(
+            &username,
+            "/private/post/unfriend",
+            &UnfriendRequest {
+                from: username.as_ref().clone(),
+                to: friend.as_ref().clone(),
+            },
+        )
+        .await
+    }
 }
 
 #[test]
 fn test() {
+    use std::process::Command;
+    use std::thread;
+    use std::time::Duration;
+
     let server1 = Command::new("cargo")
         .arg("run")
         .arg("-p")
         .arg("nexus-server")
         .arg("--")
         .arg("8000")
-        .spawn().unwrap();
+        .spawn()
+        .unwrap();
     let server2 = Command::new("cargo")
         .arg("run")
         .arg("-p")
         .arg("nexus-server")
         .arg("--")
         .arg("9000")
-        .spawn().unwrap();
+        .spawn()
+        .unwrap();
     thread::sleep(Duration::from_secs(5));
     tokio::runtime::Runtime::new()
         .unwrap()
@@ -129,12 +195,12 @@ async fn actual_test() -> anyhow::Result<()> {
     let malek = Username::from("malek.localhost:8000");
     let lyuma = Username::from("lyuma.localhost:9000");
 
-    add_user(&client, &malek).await?;
-    add_user(&client, &lyuma).await?;
+    client.add_user(&malek).await?;
+    client.add_user(&lyuma).await?;
 
     let fuuid = FriendRequestUuid(String::from("0"));
 
-    let friends = get_friends(&client, &malek).await?;
+    let friends = client.get_friends(&malek).await?;
     assert_eq!(friends.len(), 0);
 
     let friend_request = FriendRequest {
@@ -143,29 +209,47 @@ async fn actual_test() -> anyhow::Result<()> {
         uuid: fuuid.clone(),
     };
 
-    send_friend_request(&client, friend_request.clone()).await?;
-    let s = sent_friend_requests(&client, &malek).await?;
+    client.send_friend_request(&friend_request).await?;
+    let s = client.sent_friend_requests(&malek).await?;
     assert_eq!(s.len(), 1);
     assert_eq!(s.first().unwrap().0, fuuid.0);
-    let s = rec_friend_requests(&client, &lyuma).await?;
+    let s = client.rec_friend_requests(&lyuma).await?;
     assert_eq!(s.len(), 1);
     assert_eq!(s.first().unwrap().0, fuuid.0);
-    let friend_request2 = get_friend_request(&client, &lyuma, s.first().unwrap().clone()).await?;
+    let friend_request2 = client
+        .get_friend_request(&lyuma, s.first().unwrap().clone())
+        .await?;
     assert_eq!(friend_request2, friend_request);
-    accept_friend_request(&client, &lyuma, fuuid.clone()).await?;
-    assert_eq!(get_friends(&client, &malek).await?.first().with_context(|| "empty")?.clone(), lyuma);
-    assert_eq!(get_friends(&client, &lyuma).await?.first().with_context(|| "empty")?.clone(), malek);
-    unfriend(&client, &malek, &lyuma).await?;
-    assert_eq!(get_friends(&client, &malek).await?.len(), 0);
-    assert_eq!(get_friends(&client, &lyuma).await?.len(), 0);
+    client.accept_friend_request(&lyuma, fuuid.clone()).await?;
+    assert_eq!(
+        client
+            .get_friends(&malek)
+            .await?
+            .first()
+            .with_context(|| "empty")?
+            .clone(),
+        lyuma
+    );
+    assert_eq!(
+        client
+            .get_friends(&lyuma)
+            .await?
+            .first()
+            .with_context(|| "empty")?
+            .clone(),
+        malek
+    );
+    client.unfriend(&malek, &lyuma).await?;
+    assert_eq!(client.get_friends(&malek).await?.len(), 0);
+    assert_eq!(client.get_friends(&lyuma).await?.len(), 0);
 
-    send_friend_request(&client, friend_request.clone()).await?;
-    deny_friend_request(&client, &lyuma, fuuid.clone()).await?;
+    client.send_friend_request(&friend_request).await?;
+    client.deny_friend_request(&lyuma, fuuid.clone()).await?;
 
-    assert_eq!(get_friends(&client, &malek).await?.len(), 0);
-    assert_eq!(get_friends(&client, &lyuma).await?.len(), 0);
-    assert_eq!(sent_friend_requests(&client, &malek).await?.len(), 0);
-    assert_eq!(rec_friend_requests(&client, &lyuma).await?.len(), 0);
+    assert_eq!(client.get_friends(&malek).await?.len(), 0);
+    assert_eq!(client.get_friends(&lyuma).await?.len(), 0);
+    assert_eq!(client.sent_friend_requests(&malek).await?.len(), 0);
+    assert_eq!(client.rec_friend_requests(&lyuma).await?.len(), 0);
 
     Ok(())
 }

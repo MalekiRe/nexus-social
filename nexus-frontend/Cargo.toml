@@ -1,0 +1,10 @@
+[package]
+name = "nexus-frontend"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+druid = { version = "0.8", features = ["im"] }
+nexus-client = { workspace = true }
+nexus-common = { workspace = true }
+tokio = { workspace = true }
