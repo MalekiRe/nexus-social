@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{remove_dir};
 use std::net::SocketAddr;
@@ -41,12 +41,12 @@ impl<E> From<E> for AppError
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct UserData {
     pub friends: Vec<Username>,
-    pub sent_friend_requests: Vec<FriendRequestUuid>,
-    pub rec_friend_requests: Vec<FriendRequestUuid>,
+    pub sent_friend_requests: HashSet<FriendRequestUuid>,
+    pub rec_friend_requests: HashSet<FriendRequestUuid>,
     pub friend_requests: HashMap<FriendRequestUuid, FriendRequest>,
     pub invites: HashMap<InviteUuid, Invite>,
-    pub sent_invites: Vec<InviteUuid>,
-    pub rec_invites: Vec<InviteUuid>,
+    pub sent_invites: HashSet<InviteUuid>,
+    pub rec_invites: HashSet<InviteUuid>,
 }
 
 impl From<UserData> for IVec {
@@ -102,13 +102,19 @@ async fn main() -> anyhow::Result<()> {
         .route("/", get(root))
         .route("/add-user/:username", get(add_user))
         .route("/:username/private/get/friends", get(client_server::get_friends))
+        .route("/:username/private/get/sent-invites", get(client_server::get_sent_invites))
+        .route("/:username/private/get/rec-invites", get(client_server::get_rec_invites))
         .route("/:username/private/get/sent-friend-requests", get(client_server::get_sent_friend_requests))
         .route("/:username/private/get/rec-friend-requests", get(client_server::get_rec_friend_requests))
+        .route("/:username/private/get/invite/:uuid", get(client_server::get_invite))
         .route("/:username/private/get/friend-request/:uuid", get(client_server::get_friend_request))
+        .route("/:username/private/post/send-invite", post(client_server::post_send_invite))
+        .route("/:username/private/post/remove-invite", post(client_server::post_remove_invite))
         .route("/:username/private/post/send-friend-request", post(client_server::post_send_friend_request))
         .route("/:username/private/post/accept-friend-request", post(client_server::post_accept_friend_request))
         .route("/:username/private/post/deny-friend-request", post(client_server::post_deny_friend_request))
         .route("/:username/private/post/unfriend", post(client_server::post_unfriend))
+        .route("/:username/friend/post/send-invite", post(server_server::post_send_invite))
         .route("/:username/public/post/send-friend-request", post(server_server::post_send_friend_request))
         .route("/:username/public/post/accept-friend-request", post(server_server::post_accept_friend_request))
         .route("/:username/public/post/deny-friend-request", post(server_server::post_deny_friend_request))
@@ -137,7 +143,7 @@ mod client_server {
     use serde_json::Value;
     use anyhow::{Context};
     use crate::Result;
-    use nexus_common::{FriendRequest, FriendRequestUuid, UnfriendRequest};
+    use nexus_common::{FriendRequest, FriendRequestUuid, Invite, InviteUuid, UnfriendRequest};
     use crate::State;
 
     pub async fn get_friends(Extension(state): Extension<State>, Path(username): Path<String>) -> Result<impl IntoResponse> {
@@ -145,6 +151,12 @@ mod client_server {
             .user(username)?
             .friends
         )?)
+    }
+    pub async fn get_sent_invites(Extension(state): Extension<State>, Path(username): Path<String>) -> Result<impl IntoResponse> {
+        Ok(serde_json::to_string(&state.user(username)?.sent_invites)?)
+    }
+    pub async fn get_rec_invites(Extension(state): Extension<State>, Path(username): Path<String>) -> Result<impl IntoResponse> {
+        Ok(serde_json::to_string(&state.user(username)?.rec_invites)?)
     }
     pub async fn get_sent_friend_requests(Extension(state): Extension<State>, Path(username): Path<String>) -> Result<impl IntoResponse> {
         Ok(serde_json::to_string(&state
@@ -158,6 +170,9 @@ mod client_server {
             .rec_friend_requests
         )?)
     }
+    pub async fn get_invite(Extension(state): Extension<State>, Path((username, uuid)): Path<(String, String)>) -> Result<impl IntoResponse> {
+        Ok(serde_json::to_string(&state.user(username)?.invites.get(&InviteUuid(uuid)).with_context(|| "InviteUuid not found")?)?)
+    }
     pub async fn get_friend_request(Extension(state): Extension<State>, Path((username, uuid)): Path<(String, String)>) -> Result<impl IntoResponse> {
         Ok(serde_json::to_string(&state
             .user(username)?
@@ -165,10 +180,30 @@ mod client_server {
                 .get(&FriendRequestUuid(uuid)).with_context(|| "FriendRequestUuid not found")?
         )?)
     }
+    pub async fn post_send_invite(Extension(state): Extension<State>, Path(username): Path<String>, Json(payload): Json<Value>) -> Result<impl IntoResponse> {
+        let invite: Invite = serde_json::from_value(payload)?;
+        state.user_mut(&username, |user| { user.invites.insert(invite.uuid.clone(), invite.clone());})?;
+        state.user_mut(&username, |user| { user.sent_invites.insert(invite.uuid.clone());})?;
+        state.reqwest_client
+            .post(invite.to.to_url().0 + "/friend/post/send-invite")
+            .json(&invite)
+            .send()
+            .await?;
+        Ok(())
+    }
+    pub async fn post_remove_invite(Extension(state): Extension<State>, Path(username): Path<String>, Json(payload): Json<Value>) -> Result<impl IntoResponse> {
+        println!("client_client::post_remove_invite");
+        let invite_uuid: InviteUuid = serde_json::from_value(payload)?;
+        state.user_mut(&username, |user| { user.invites.remove(&invite_uuid); })?;
+        state.user_mut(&username, |user| { user.rec_invites.remove(&invite_uuid); })?;
+        state.user_mut(&username, |user| { user.sent_invites.remove(&invite_uuid); })?;
+        Ok(())
+    }
+
     pub async fn post_send_friend_request(Extension(state): Extension<State>, Path(username): Path<String>, Json(payload): Json<Value>) -> Result<impl IntoResponse> {
         let friend_request: FriendRequest = serde_json::from_value(payload)?;
         state.try_user_mut(&username, |user| Ok({ user.friend_requests.insert(friend_request.uuid.clone(), friend_request.clone()); }))?;
-        state.try_user_mut(&username, |user| Ok({ user.sent_friend_requests.push(friend_request.uuid.clone()); }))?;
+        state.try_user_mut(&username, |user| Ok({ user.sent_friend_requests.insert(friend_request.uuid.clone()); }))?;
         state.reqwest_client
             .post(friend_request.to.to_url().0 + "/public/post/send-friend-request")
             .json(&friend_request)
@@ -182,9 +217,7 @@ mod client_server {
         let user_from = state.user(&username)?.friend_requests.remove(&friend_request_uuid)
             .context("FriendRequestUuid not found")?.from;
         state.user_mut(&username, |user| { user.friend_requests.remove(&friend_request_uuid).unwrap(); })?;
-        let pos = state.user(&username)?.rec_friend_requests.iter().position(|uuid| uuid.0 == friend_request_uuid.0)
-            .with_context(|| "FriendRequestUuid not found")?;
-        state.user_mut(&username, |user| { user.rec_friend_requests.remove(pos); })?;
+        state.user_mut(&username, |user| { user.rec_friend_requests.remove(&friend_request_uuid); })?;
         state.reqwest_client
             .post(user_from.to_url().0 + "/public/post/accept-friend-request")
             .json(&friend_request_uuid)
@@ -199,9 +232,7 @@ mod client_server {
         let user_from = state.user(&username)?.friend_requests.remove(&friend_request_uuid)
             .context("FriendRequestUuid not found")?.from;
         state.user_mut(&username, |user| { user.friend_requests.remove(&friend_request_uuid).unwrap(); })?;
-        let pos = state.user(&username)?.rec_friend_requests.iter().position(|uuid| uuid.0 == friend_request_uuid.0)
-            .with_context(|| "FriendRequestUuid not found")?;
-        state.user_mut(&username, |user| { user.rec_friend_requests.remove(pos); })?;
+        state.user_mut(&username, |user| { user.rec_friend_requests.remove(&friend_request_uuid); })?;
         state.reqwest_client
             .post(user_from.to_url().0 + "/public/post/deny-friend-request")
             .json(&friend_request_uuid)
@@ -227,23 +258,31 @@ mod server_server {
     use axum::extract::Path;
     use axum::response::IntoResponse;
     use serde_json::Value;
-    use nexus_common::{FriendRequest, FriendRequestUuid, UnfriendRequest};
+    use nexus_common::{FriendRequest, FriendRequestUuid, Invite, UnfriendRequest};
     use anyhow::{Context};
     use crate::State;
     use crate::Result;
+
+    pub async fn post_send_invite(Extension(state): Extension<State>, Path(username): Path<String>, Json(payload): Json<Value>) -> Result<impl IntoResponse> {
+        println!("server_server::post_send_invite");
+        let invite: Invite = serde_json::from_value(payload)?;
+        state.user_mut(&username, |user| { user.invites.insert(invite.uuid.clone(), invite.clone()); })?;
+        state.user_mut(&username, |user| { user.rec_invites.insert(invite.uuid.clone()); })?;
+        Ok(())
+    }
 
     pub async fn post_send_friend_request(Extension(state): Extension<State>, Path(username): Path<String>, Json(payload): Json<Value>) -> Result<impl IntoResponse> {
         println!("server_server::post_send_friend_request");
         let friend_request: FriendRequest = serde_json::from_value(payload)?;
         state.user_mut(&username, |user| { user.friend_requests.insert(friend_request.uuid.clone(), friend_request.clone()); })?;
-        state.user_mut(&username, |user| user.rec_friend_requests.push(friend_request.uuid.clone()))?;
+        state.user_mut(&username, |user| { user.rec_friend_requests.insert(friend_request.uuid.clone()); })?;
         Ok(())
     }
 
     pub async fn post_accept_friend_request(Extension(state): Extension<State>, Path(username): Path<String>, Json(payload): Json<Value>) -> Result<impl IntoResponse> {
         println!("server_server::post_accept_friend_request");
         let friend_request_uuid: FriendRequestUuid = serde_json::from_value(payload)?;
-        state.user_mut(&username, |user| user.sent_friend_requests.retain(|f| f.0 != friend_request_uuid.0))?;
+        state.user_mut(&username, |user| { user.sent_friend_requests.remove(&friend_request_uuid); })?;
         let friend_request = state.user(&username)?.friend_requests.remove(&friend_request_uuid).with_context(|| "FriendRequestUuid did not exist")?;
         state.user_mut(&username, |user| { user.friend_requests.remove(&friend_request_uuid).unwrap(); })?;
         state.user_mut(username, |user| user.friends.push(friend_request.to.clone()))?;

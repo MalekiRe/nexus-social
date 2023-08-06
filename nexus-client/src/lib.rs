@@ -4,12 +4,12 @@ use std::thread;
 use std::time::Duration;
 use anyhow::Context;
 use reqwest::Client;
-use nexus_common::{FriendRequest, FriendRequestUuid, Username};
-use crate::client::{accept_friend_request, deny_friend_request, get_friend_request, get_friends, rec_friend_requests, send_friend_request, sent_friend_requests, unfriend};
+use nexus_common::{FriendRequest, FriendRequestUuid, Invite, InviteUuid, Username};
+use crate::client::{accept_friend_request, deny_friend_request, get_friend_request, get_friends, get_invite, get_rec_invites, get_sent_invites, rec_friend_requests, remove_invite, send_friend_request, send_invite, sent_friend_requests, unfriend};
 
 pub mod client {
     use reqwest::Client;
-    use nexus_common::{FriendRequest, FriendRequestUuid, UnfriendRequest, Username};
+    use nexus_common::{FriendRequest, FriendRequestUuid, Invite, InviteUuid, UnfriendRequest, Username};
     use anyhow::Result;
     use futures::StreamExt;
     use crate::username_t;
@@ -18,6 +18,40 @@ pub mod client {
         Ok(client.get(username.as_ref().to_url().0 + "/private/get/friends")
             .send()
             .await?
+            .json::<_>()
+            .await?)
+    }
+    pub async fn send_invite(client: &Client, invite: Invite) -> Result<()> {
+        client.post(invite.from.to_url().0 + "/private/post/send-invite")
+            .json(&invite)
+            .send()
+            .await?;
+        Ok(())
+    }
+    pub async fn remove_invite(client: &Client, username: impl AsRef<Username>, invite_uuid: InviteUuid) -> Result<()> {
+        client.post(username.as_ref().to_url().0 + "/private/post/remove-invite")
+            .json(&invite_uuid)
+            .send()
+            .await?;
+        Ok(())
+    }
+    pub async fn get_rec_invites(client: &Client, username: impl AsRef<Username>) -> Result<Vec<InviteUuid>> {
+        Ok(client.get(username.as_ref().to_url().0 + "/private/get/rec-invites")
+            .send()
+            .await?
+            .json::<_>()
+            .await?)
+    }
+    pub async fn get_sent_invites(client: &Client, username: impl AsRef<Username>) -> Result<Vec<InviteUuid>> {
+        Ok(client.get(username.as_ref().to_url().0 + "/private/get/sent-invites")
+            .send()
+            .await?
+            .json::<_>()
+            .await?)
+    }
+    pub async fn get_invite(client: &Client, username: impl AsRef<Username>, invite_uuid: InviteUuid) -> Result<Invite> {
+        Ok(client.get(username.as_ref().to_url().0 + "/private/get/invite/" + &invite_uuid.0)
+            .send().await?
             .json::<_>()
             .await?)
     }
@@ -155,6 +189,27 @@ async fn actual_test() -> anyhow::Result<()> {
     accept_friend_request(&client, &lyuma, fuuid.clone()).await?;
     assert_eq!(get_friends(&client, &malek).await?.first().with_context(|| "empty")?.clone(), lyuma);
     assert_eq!(get_friends(&client, &lyuma).await?.first().with_context(|| "empty")?.clone(), malek);
+
+    let invite_uuid = InviteUuid(String::from("1"));
+
+    let invite = Invite {
+        from: lyuma.clone(),
+        to: malek.clone(),
+        uuid: invite_uuid.clone(),
+    };
+
+    send_invite(&client, invite.clone()).await?;
+
+    assert_eq!(get_sent_invites(&client, &lyuma).await?.len(), 1);
+    assert_eq!(get_rec_invites(&client, &malek).await?.len(), 1);
+    assert_eq!(get_invite(&client, &malek, get_rec_invites(&client, &malek).await?.first().unwrap().clone()).await.unwrap(), invite);
+
+    remove_invite(&client, &malek, invite_uuid.clone()).await?;
+    remove_invite(&client, &lyuma, invite_uuid.clone()).await?;
+    assert_eq!(get_rec_invites(&client, &malek).await?.len(), 0);
+    assert_eq!(get_sent_invites(&client, &lyuma).await?.len(), 0);
+
+
     unfriend(&client, &malek, &lyuma).await?;
     assert_eq!(get_friends(&client, &malek).await?.len(), 0);
     assert_eq!(get_friends(&client, &lyuma).await?.len(), 0);
