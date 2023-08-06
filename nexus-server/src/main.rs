@@ -40,6 +40,8 @@ where
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt::init();
+
     let mut port = 8000;
     if let Some(p) = std::env::args().into_iter().collect::<Vec<_>>().get(1) {
         port = p.parse().unwrap();
