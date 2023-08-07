@@ -14,3 +14,4 @@ reqwest = { workspace = true }
 egui = "0.22.0"
 eframe = "0.22.0"
 egui-toast = "0.8.0"
+uuid = { version = "1.4.1", features = ["v4"]}
