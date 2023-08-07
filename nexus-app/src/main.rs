@@ -87,6 +87,15 @@ impl MyApp {
             friend_request_str: "".to_string(),
         }
     }
+    fn refresh(&mut self, username: &Username) {
+        let runtime = self.runtime.take().unwrap();
+        runtime.block_on(async {
+            if let Err(error) = self.sync_data(username).await {
+                self.add_error(error.to_string());
+            }
+        });
+        self.runtime.replace(runtime);
+    }
     async fn sync_data(&mut self, username: &Username) -> Result<()> {
         self.user_data.sent_friend_requests = client::sent_friend_requests(&self.client, username).await?.into_iter().collect();
         self.user_data.rec_friend_requests = client::rec_friend_requests(&self.client, username).await?.into_iter().collect();
@@ -120,13 +129,7 @@ impl eframe::App for MyApp {
                 return;
             }
             if ui.button("refresh").clicked() {
-                let runtime = self.runtime.take().unwrap();
-                runtime.block_on(async {
-                   if let Err(error) = self.sync_data(&username).await {
-                       self.add_error(error.to_string());
-                   }
-                });
-                self.runtime.replace(runtime);
+                self.refresh(&username);
             }
             ui.text_edit_singleline(&mut self.friend_request_str);
             if ui.button("send friend request").clicked() {
@@ -180,7 +183,8 @@ impl eframe::App for MyApp {
                         self.add_error(String::from("username did not parse"));
                     }
                     Some(username) => {
-                        self.username.replace(username);
+                        self.username.replace(username.clone());
+                        self.refresh(&username);
                     }
                 }
             }
