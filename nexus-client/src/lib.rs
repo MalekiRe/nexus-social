@@ -119,6 +119,11 @@ pub async fn add_user(client: &Client, username: impl AsRef<Username>) -> anyhow
 
 #[test]
 fn test() {
+    Command::new("cargo")
+        .arg("build")
+        .arg("-p")
+        .arg("nexus-server")
+        .spawn().unwrap().wait().unwrap();
     let server1 = Command::new("cargo")
         .arg("run")
         .arg("-p")
@@ -133,7 +138,7 @@ fn test() {
         .arg("--")
         .arg("9000")
         .spawn().unwrap();
-    thread::sleep(Duration::from_secs(5));
+    thread::sleep(Duration::from_secs(1));
     tokio::runtime::Runtime::new()
         .unwrap()
         .block_on(wrapper(ServerRunner::new(vec![server1, server2])));
