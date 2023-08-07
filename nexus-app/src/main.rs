@@ -14,7 +14,7 @@ use tokio::runtime::Runtime;
 use nexus_client::client;
 use nexus_common::non_api_structs::UserData;
 use nexus_client::client::*;
-use nexus_common::{FriendRequest, FriendRequestUuid, Username};
+use nexus_common::{FriendRequest, FriendRequestUuid, UnfriendRequest, Username};
 
 fn main() -> Result<()> {
     let server_runner = ServerRunner::new();
@@ -122,6 +122,9 @@ impl MyApp {
 }
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &Context, frame: &mut Frame) {
+        let mut errors = vec![];
+        let mut need_refresh = false;
+        let runtime = self.runtime.take().unwrap();
         egui::CentralPanel::default().show(ctx, |ui| {
         if let Some(username) = self.username.clone() {
             if ui.button("logout").clicked() {
@@ -129,14 +132,13 @@ impl eframe::App for MyApp {
                 return;
             }
             if ui.button("refresh").clicked() {
-                self.refresh(&username);
+                need_refresh = true;
             }
             ui.text_edit_singleline(&mut self.friend_request_str);
             if ui.button("send friend request").clicked() {
                 match Username::from(&self.friend_request_str) {
                     None => self.add_error(String::from("friend request username invalid")),
                     Some(friend_request_username) => {
-                        let runtime = self.runtime.take().unwrap();
                         runtime.block_on(async {
                             let friend_request = FriendRequest {
                                 from: username.clone(),
@@ -148,7 +150,7 @@ impl eframe::App for MyApp {
                                 Err(error) => self.add_error(error.to_string()),
                             };
                         });
-                        self.runtime.replace(runtime);
+                        need_refresh = true;
                     }
                 }
             }
@@ -156,6 +158,14 @@ impl eframe::App for MyApp {
                 ui.collapsing("friends", |ui| {
                     for friend in &self.user_data.friends {
                         ui.group(|ui| {
+                            if ui.button("unfriend").clicked() {
+                                runtime.block_on(async {
+                                   if let Err(error) = client::unfriend(&self.client, &username, friend).await {
+                                       errors.push(error.to_string());
+                                   }
+                                });
+                                need_refresh = true;
+                            }
                             ui.label(format!("{}{}", friend.username, friend.website));
                         });
                     }
@@ -163,14 +173,34 @@ impl eframe::App for MyApp {
                 ui.collapsing("sent friend requests", |ui| {
                     for f in &self.user_data.sent_friend_requests {
                         if let Some(f2) = self.user_data.friend_requests.get(f) {
-                            ui.label(format!("{:#?}", f2));
+                            ui.group(|ui| {
+                                ui.label(format!("{:#?}", f2));
+                            });
                         }
                     }
                 });
                 ui.collapsing("rec friend requests", |ui| {
                    for f in &self.user_data.rec_friend_requests {
                        if let Some(f2) = self.user_data.friend_requests.get(f) {
-                           ui.label(format!("{:#?}", f2));
+                           ui.group(|ui| {
+                               if ui.button("accept").clicked() {
+                                   need_refresh = true;
+                                   runtime.block_on(async {
+                                      if let Err(error) = client::accept_friend_request(&self.client, &username, f2.uuid.clone()).await {
+                                          errors.push(error.to_string());
+                                      }
+                                   });
+                               }
+                               if ui.button("deny").clicked() {
+                                   need_refresh = true;
+                                   runtime.block_on(async {
+                                       if let Err(error) = client::deny_friend_request(&self.client, &username, f2.uuid.clone()).await {
+                                           errors.push(error.to_string());
+                                       }
+                                   });
+                               }
+                               ui.label(format!("{:#?}", f2));
+                           });
                        }
                    }
                 });
@@ -184,12 +214,21 @@ impl eframe::App for MyApp {
                     }
                     Some(username) => {
                         self.username.replace(username.clone());
-                        self.refresh(&username);
+                        need_refresh = true;
                     }
                 }
             }
         }
         });
+        self.runtime.replace(runtime);
+        if need_refresh {
+            if let Some(username) = self.username.clone() {
+                self.refresh(&username);
+            }
+        }
+        for error in errors {
+            self.add_error(error)
+        }
         self.toasts.show(ctx);
     }
 }

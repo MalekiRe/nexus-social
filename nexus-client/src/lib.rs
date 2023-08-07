@@ -110,7 +110,7 @@ pub mod client {
     }
 }
 
-async fn add_user(client: &Client, username: impl AsRef<Username>) -> anyhow::Result<()> {
+pub async fn add_user(client: &Client, username: impl AsRef<Username>) -> anyhow::Result<()> {
     let username = username.as_ref();
     client.get(String::from("http://") + &username.website + "/add-user/" + &username.username)
         .send().await?;
