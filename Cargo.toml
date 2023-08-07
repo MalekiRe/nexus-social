@@ -6,7 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [workspace]
-members = ["nexus-server", "nexus-client"]
+members = ["nexus-server", "nexus-client", "nexus-app"]
 
 [workspace.dependencies]
 serde = { version = "1.0.173", features = ["derive"]  }

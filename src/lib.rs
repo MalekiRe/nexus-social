@@ -1,3 +1,5 @@
+pub mod non_api_structs;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Eq, PartialEq, Ord, PartialOrd, Hash, Clone, Debug, Serialize, Deserialize, Default)]
@@ -12,12 +14,12 @@ impl AsRef<Username> for Username {
     }
 }
 impl Username {
-    pub fn from(string: impl AsRef<str>) -> Self {
+    pub fn from(string: impl AsRef<str>) -> Option<Self> {
         let string = string.as_ref().to_string();
-        Self {
-            username: string.split_once('.').unwrap().0.to_string(),
-            website: string.split_once('.').unwrap().1.to_string(),
-        }
+        Some(Self {
+            username: string.split_once('.')?.0.to_string(),
+            website: string.split_once('.')?.1.to_string(),
+        })
     }
     pub fn to_url(&self) -> Url {
         Url(String::from("http://") + &self.website + "/" + &self.username)

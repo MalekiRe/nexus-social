@@ -160,8 +160,8 @@ async fn wrapper(server_runner: ServerRunner) {
 async fn actual_test() -> anyhow::Result<()> {
     let client = Client::new();
 
-    let malek = Username::from("malek.localhost:8000");
-    let lyuma = Username::from("lyuma.localhost:9000");
+    let malek = Username::from("malek.localhost:8000").unwrap();
+    let lyuma = Username::from("lyuma.localhost:9000").unwrap();
 
     add_user(&client, &malek).await?;
     add_user(&client, &lyuma).await?;
@@ -251,7 +251,7 @@ impl From<username_t> for Username {
     }
 }
 
-pub extern "C" fn client_get_friends(username: username_t, len: *mut usize) -> *mut Username {
+extern "C" fn client_get_friends(username: username_t, len: *mut usize) -> *mut Username {
     todo!()
     // async fn internal(username: username_t, len: *mut usize) -> *mut Username {
     //     let mut f = client::get_friends(&Client::new(), username.into())

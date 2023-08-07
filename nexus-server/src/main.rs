@@ -10,6 +10,7 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use sled::{Db, IVec};
 use nexus_common::{FriendRequest, FriendRequestUuid, Invite, InviteUuid, Username};
+use nexus_common::non_api_structs::UserData;
 use anyhow::{Context};
 
 pub type Result<T> = std::result::Result<T, AppError>;
@@ -35,23 +36,6 @@ impl<E> From<E> for AppError
 {
     fn from(err: E) -> Self {
         Self(err.into())
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
-pub struct UserData {
-    pub friends: Vec<Username>,
-    pub sent_friend_requests: HashSet<FriendRequestUuid>,
-    pub rec_friend_requests: HashSet<FriendRequestUuid>,
-    pub friend_requests: HashMap<FriendRequestUuid, FriendRequest>,
-    pub invites: HashMap<InviteUuid, Invite>,
-    pub sent_invites: HashSet<InviteUuid>,
-    pub rec_invites: HashSet<InviteUuid>,
-}
-
-impl From<UserData> for IVec {
-    fn from(value: UserData) -> Self {
-        serde_json::to_vec(&value).unwrap().into()
     }
 }
 
